@@ -4,388 +4,210 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, date
+from datetime import date
+from io import BytesIO
 
-st.set_page_config(
-    page_title="Global Market Intelligence",
-    page_icon="🌍",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Rakesh | Global Market Intelligence", page_icon="🌍", layout="wide")
 
-# -----------------------------
-# Index universe
-# -----------------------------
-INDEX_MASTER = {
-    "NIFTY 50": {"symbol": "^NSEI", "region": "India"},
-    "BANK NIFTY": {"symbol": "^NSEBANK", "region": "India"},
-    "SENSEX": {"symbol": "^BSESN", "region": "India"},
-    "S&P 500": {"symbol": "^GSPC", "region": "USA"},
-    "NASDAQ 100": {"symbol": "^NDX", "region": "USA"},
-    "DOW JONES": {"symbol": "^DJI", "region": "USA"},
-    "FTSE 100": {"symbol": "^FTSE", "region": "Europe"},
-    "DAX 40": {"symbol": "^GDAXI", "region": "Europe"},
-    "CAC 40": {"symbol": "^FCHI", "region": "Europe"},
-    "IBEX 35": {"symbol": "^IBEX", "region": "Europe"},
-    "SWISS MARKET INDEX": {"symbol": "^SSMI", "region": "Europe"},
-    "NIKKEI 225": {"symbol": "^N225", "region": "Asia Pacific"},
-    "HANG SENG": {"symbol": "^HSI", "region": "Asia Pacific"},
-    "SHANGHAI COMPOSITE": {"symbol": "000001.SS", "region": "Asia Pacific"},
-    "KOSPI": {"symbol": "^KS11", "region": "Asia Pacific"},
-    "TAIWAN WEIGHTED": {"symbol": "^TWII", "region": "Asia Pacific"},
-    "STRAITS TIMES": {"symbol": "^STI", "region": "Asia Pacific"},
-    "ASX 200": {"symbol": "^AXJO", "region": "Asia Pacific"},
-    "BRAZIL IBOVESPA": {"symbol": "^BVSP", "region": "Latin America"},
-    "MEXICO IPC": {"symbol": "^MXX", "region": "Latin America"},
+INDEXES = {
+"NIFTY 50":("^NSEI","India"), "BANK NIFTY":("^NSEBANK","India"), "SENSEX":("^BSESN","India"),
+"S&P 500":("^GSPC","USA"), "NASDAQ 100":("^NDX","USA"), "DOW JONES":("^DJI","USA"),
+"FTSE 100":("^FTSE","Europe"), "DAX 40":("^GDAXI","Europe"), "CAC 40":("^FCHI","Europe"),
+"IBEX 35":("^IBEX","Europe"), "SWISS MARKET INDEX":("^SSMI","Europe"),
+"NIKKEI 225":("^N225","Asia Pacific"), "HANG SENG":("^HSI","Asia Pacific"),
+"SHANGHAI COMPOSITE":("000001.SS","Asia Pacific"), "KOSPI":("^KS11","Asia Pacific"),
+"TAIWAN WEIGHTED":("^TWII","Asia Pacific"), "STRAITS TIMES":("^STI","Asia Pacific"),
+"ASX 200":("^AXJO","Asia Pacific"), "BRAZIL IBOVESPA":("^BVSP","Latin America"),
+"MEXICO IPC":("^MXX","Latin America")
 }
+TRENDS = ["STRONG BULLISH","BULLISH","MIXED / SIDEWAYS","BEARISH","STRONG BEARISH","INSUFFICIENT HISTORY"]
+
+def rsi_calc(s, n=14):
+    d=s.diff(); up=d.clip(lower=0); down=-d.clip(upper=0)
+    au=up.ewm(alpha=1/n,min_periods=n,adjust=False).mean()
+    ad=down.ewm(alpha=1/n,min_periods=n,adjust=False).mean()
+    rs=au/ad.replace(0,np.nan); r=100-100/(1+rs)
+    r=r.mask((ad==0)&(au>0),100).mask((ad==0)&(au==0),50)
+    return r
+
+def ret(s,n):
+    if len(s)<=n: return np.nan
+    return (float(s.iloc[-1])/float(s.iloc[-n-1])-1)*100
+
+def trend(p,a,b,c):
+    if any(pd.isna(x) for x in [a,b,c]): return "INSUFFICIENT HISTORY"
+    if p>a>b>c: return "STRONG BULLISH"
+    if p<a<b<c: return "STRONG BEARISH"
+    if p>b and p>c: return "BULLISH"
+    if p<b and p<c: return "BEARISH"
+    return "MIXED / SIDEWAYS"
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_market_data(period="1y"):
-    rows = []
-    histories = {}
-    errors = []
-    for name, info in INDEX_MASTER.items():
-        symbol = info["symbol"]
+def get_data(period):
+    rows=[]; hist={}; issues=[]
+    for name,(symbol,region) in INDEXES.items():
         try:
-            raw = yf.download(
-                symbol, period=period, interval="1d",
-                auto_adjust=True, progress=False, threads=False,
-                timeout=25
-            )
-            if raw.empty:
-                errors.append({"Index": name, "Symbol": symbol, "Issue": "No data returned"})
-                continue
+            raw=yf.download(symbol,period=period,interval="1d",auto_adjust=True,progress=False,threads=False,timeout=25)
+            if raw.empty: raise ValueError("No data returned")
+            s=raw["Close"]
+            if isinstance(s,pd.DataFrame): s=s.iloc[:,0]
+            s=pd.to_numeric(s,errors="coerce").dropna()
+            s=s[~s.index.duplicated(keep="last")].sort_index()
+            if len(s)<22: raise ValueError("Insufficient price history")
+            if (s<=0).any(): raise ValueError("Invalid non-positive price")
+            p=float(s.iloc[-1]); a=s.rolling(20).mean().iloc[-1]; b=s.rolling(50).mean().iloc[-1]
+            c=s.rolling(200).mean().iloc[-1] if len(s)>=200 else np.nan
+            rv=rsi_calc(s).iloc[-1]; rv=float(rv) if pd.notna(rv) else np.nan
+            d=ret(s,1); dt=pd.Timestamp(s.index[-1]).date(); age=(date.today()-dt).days
+            mom="UNAVAILABLE" if pd.isna(rv) else ("OVERBOUGHT" if rv>=70 else "OVERSOLD" if rv<=30 else "NEUTRAL")
+            flags=[]
+            if pd.notna(d) and abs(d)>=3: flags.append("VERIFY LARGE MOVE")
+            if age>7: flags.append("CHECK STALE DATA")
+            if len(s)<200: flags.append("LESS THAN 200 SESSIONS")
+            rows.append({"Index":name,"Region":region,"Symbol":symbol,"Last Price":p,"Daily %":d,
+             "Weekly %":ret(s,5),"Monthly %":ret(s,21),"Quarterly %":ret(s,63),
+             "SMA 20":a,"SMA 50":b,"SMA 200":c,"RSI 14":rv,"Trend":trend(p,a,b,c),
+             "Momentum":mom,"Data Date":str(dt),"Data Age Days":age,
+             "Quality Status":"; ".join(flags) if flags else "NORMAL"})
+            hist[name]=s.rename(name)
+        except Exception as e: issues.append({"Index":name,"Symbol":symbol,"Issue":str(e)[:180]})
+    return pd.DataFrame(rows),hist,pd.DataFrame(issues)
 
-            close_data = raw["Close"]
-            if isinstance(close_data, pd.DataFrame):
-                close_data = close_data.iloc[:, 0]
-            close = pd.to_numeric(close_data, errors="coerce").dropna()
-            close = close[~close.index.duplicated(keep="last")].sort_index()
+def excel_bytes(data,regional,weekly,monthly,quality,issues,history):
+    out=BytesIO()
+    with pd.ExcelWriter(out,engine="openpyxl") as w:
+        for name,df in {"Global Scanner":data,"Regional Comparison":regional,
+         "Weekly Ranking":weekly,"Monthly Ranking":monthly,"Data Quality":quality,
+         "Download Issues":issues,"Price History":history}.items():
+            df.to_excel(w,sheet_name=name,index=False)
+            ws=w.book[name]; ws.freeze_panes="A2"; ws.auto_filter.ref=ws.dimensions
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width=min(max(max(len(str(x.value or "")) for x in col)+2,12),34)
+    out.seek(0); return out.getvalue()
 
-            if len(close) < 22:
-                errors.append({"Index": name, "Symbol": symbol, "Issue": "Insufficient history"})
-                continue
+st.sidebar.markdown("## 🌍 Rakesh's Market Scanner")
+st.sidebar.caption("Global indices • Investors • Traders")
+period_label=st.sidebar.selectbox("Historical window",["1 year","2 years"])
+period="1y" if period_label=="1 year" else "2y"
+regions_all=sorted({v[1] for v in INDEXES.values()})
+regions=st.sidebar.multiselect("Regions",regions_all,default=regions_all)
+trends=st.sidebar.multiselect("Trend filters",TRENDS,default=TRENDS)
+search=st.sidebar.text_input("Find an index",placeholder="e.g. NASDAQ")
+if st.sidebar.button("↻ Refresh data now",use_container_width=True): get_data.clear()
 
-            latest = float(close.iloc[-1])
-            prev = float(close.iloc[-2])
+st.title("🌍 Rakesh Parkar | Global Market Intelligence")
+st.caption("A global market research workspace for investors and traders")
+st.info("Data source: Yahoo Finance through the unofficial yfinance library. This is historical/end-of-day data, not a guaranteed real-time feed. Verify significant moves with exchange or licensed data. Research tool only; not investment advice.")
 
-            def ret(n):
-                if len(close) <= n:
-                    return np.nan
-                old = float(close.iloc[-(n + 1)])
-                return (latest / old - 1) * 100 if old else np.nan
-
-            sma20 = close.rolling(20).mean().iloc[-1]
-            sma50 = close.rolling(50).mean().iloc[-1]
-            sma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else np.nan
-
-            delta = close.diff()
-            gain = delta.clip(lower=0)
-            loss = -delta.clip(upper=0)
-            avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-            avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-            rs = avg_gain / avg_loss.replace(0, np.nan)
-            rsi = 100 - (100 / (1 + rs))
-            rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
-            rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50)
-            rsi14 = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else np.nan
-
-            if any(pd.isna(x) for x in [sma20, sma50, sma200]):
-                trend = "INSUFFICIENT HISTORY"
-            elif latest > sma20 > sma50 > sma200:
-                trend = "STRONG BULLISH"
-            elif latest < sma20 < sma50 < sma200:
-                trend = "STRONG BEARISH"
-            elif latest > sma50 and latest > sma200:
-                trend = "BULLISH"
-            elif latest < sma50 and latest < sma200:
-                trend = "BEARISH"
-            else:
-                trend = "MIXED / SIDEWAYS"
-
-            if pd.isna(rsi14):
-                momentum = "UNAVAILABLE"
-            elif rsi14 >= 70:
-                momentum = "OVERBOUGHT"
-            elif rsi14 <= 30:
-                momentum = "OVERSOLD"
-            else:
-                momentum = "NEUTRAL"
-
-            latest_date = pd.Timestamp(close.index[-1]).date()
-            age_days = (date.today() - latest_date).days
-            daily_return = (latest / prev - 1) * 100 if prev else np.nan
-
-            quality = "NORMAL"
-            if abs(daily_return) >= 3:
-                quality = "VERIFY LARGE MOVE"
-            if age_days > 7:
-                quality = "CHECK STALE DATA"
-
-            rows.append({
-                "Index": name,
-                "Region": info["region"],
-                "Symbol": symbol,
-                "Last Price": latest,
-                "Daily %": daily_return,
-                "Weekly %": ret(5),
-                "Monthly %": ret(21),
-                "Quarterly %": ret(63),
-                "SMA 20": sma20,
-                "SMA 50": sma50,
-                "SMA 200": sma200,
-                "RSI 14": rsi14,
-                "Trend": trend,
-                "Momentum": momentum,
-                "Data Date": str(latest_date),
-                "Data Age Days": age_days,
-                "Quality Status": quality
-            })
-            histories[name] = close.rename(name)
-        except Exception as exc:
-            errors.append({"Index": name, "Symbol": symbol, "Issue": str(exc)[:180]})
-
-    return pd.DataFrame(rows), histories, pd.DataFrame(errors)
-
-# -----------------------------
-# Sidebar controls
-# -----------------------------
-st.sidebar.title("🌍 Market Scanner")
-st.sidebar.caption("Global indices | End-of-day analysis")
-period_label = st.sidebar.selectbox(
-    "Historical data window",
-    ["1 year", "2 years"],
-    index=0
-)
-period = "1y" if period_label == "1 year" else "2y"
-regions = sorted(set(v["region"] for v in INDEX_MASTER.values()))
-selected_regions = st.sidebar.multiselect("Regions", regions, default=regions)
-selected_trends = st.sidebar.multiselect(
-    "Trend classifications",
-    ["STRONG BULLISH", "BULLISH", "MIXED / SIDEWAYS", "BEARISH", "STRONG BEARISH", "INSUFFICIENT HISTORY"],
-    default=["STRONG BULLISH", "BULLISH", "MIXED / SIDEWAYS", "BEARISH", "STRONG BEARISH", "INSUFFICIENT HISTORY"]
-)
-refresh = st.sidebar.button("↻ Refresh market data", use_container_width=True)
-if refresh:
-    st.cache_data.clear()
-
-st.title("🌍 Global Market Intelligence")
-st.caption("Global stock-index monitoring, technical indicators and regional comparisons")
-st.info(
-    "Data source: Yahoo Finance via the unofficial yfinance library. "
-    "Data may be delayed, incomplete or unavailable for some indices. "
-    "This dashboard is for research and education, not trading advice."
-)
-
-with st.spinner("Collecting available market data..."):
-    data, histories, errors = fetch_market_data(period)
-
+with st.spinner("Loading global index data..."): data,hist,issues=get_data(period)
 if data.empty:
-    st.error("No index data was retrieved. Try refreshing later or check data-source availability.")
-    st.stop()
+    st.error("No market data retrieved. Try refreshing later."); st.stop()
 
-filtered = data[
-    data["Region"].isin(selected_regions) &
-    data["Trend"].isin(selected_trends)
-].copy()
+view=data[data.Region.isin(regions)&data.Trend.isin(trends)].copy()
+if search.strip(): view=view[view.Index.str.contains(search.strip(),case=False,na=False)]
+bull=int(data.Trend.isin(["STRONG BULLISH","BULLISH"]).sum())
+bear=int(data.Trend.isin(["STRONG BEARISH","BEARISH"]).sum())
+adv=int((data["Daily %"]>0).sum()); dec=int((data["Daily %"]<0).sum())
+best=data.loc[data["Daily %"].idxmax()]; worst=data.loc[data["Daily %"].idxmin()]
+obs=max(data["Data Date"])
+st.markdown("### Global market snapshot")
+cols=st.columns(5)
+cols[0].metric("Indices retrieved",f"{len(data)} / {len(INDEXES)}")
+cols[1].metric("Bullish trend",bull); cols[2].metric("Bearish trend",bear)
+cols[3].metric("Best daily",best.Index,f"{best['Daily %']:+.2f}%")
+cols[4].metric("Weakest daily",worst.Index,f"{worst['Daily %']:+.2f}%")
+st.caption(f"Latest observation date: {obs} | Data cache: 15 minutes")
 
-# -----------------------------
-# Overview metrics
-# -----------------------------
-latest_date = data["Data Date"].max()
-bullish_count = data["Trend"].isin(["STRONG BULLISH", "BULLISH"]).sum()
-bearish_count = data["Trend"].isin(["STRONG BEARISH", "BEARISH"]).sum()
-best = data.loc[data["Daily %"].idxmax()]
-worst = data.loc[data["Daily %"].idxmin()]
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Indices retrieved", f"{len(data)} / {len(INDEX_MASTER)}")
-c2.metric("Bullish", int(bullish_count))
-c3.metric("Bearish", int(bearish_count))
-c4.metric("Best daily", best["Index"], f"{best['Daily %']:+.2f}%")
-c5.metric("Weakest daily", worst["Index"], f"{worst['Daily %']:+.2f}%")
-
-st.caption(f"Latest observation date in retrieved data: {latest_date} | Dashboard cache: 15 minutes")
-
-# -----------------------------
-# Tabs
-# -----------------------------
-tab_overview, tab_heatmap, tab_regions, tab_index, tab_quality, tab_export = st.tabs([
-    "Overview", "Heatmap", "Regions", "Index Analysis", "Data Quality", "Export"
-])
-
-with tab_overview:
+tabs=st.tabs(["Market Overview","Global Heatmap","Regional View","Bullish & Bearish","Index Deep Dive","Data Quality","Research Export"])
+with tabs[0]:
     st.subheader("Global index performance")
-    sort_by = st.selectbox(
-        "Sort table by",
-        ["Daily %", "Weekly %", "Monthly %", "Quarterly %", "RSI 14", "Index"],
-        key="overview_sort"
-    )
-    table = filtered.sort_values(sort_by, ascending=(sort_by != "Index"))
-    display_cols = [
-        "Index", "Region", "Last Price", "Daily %", "Weekly %",
-        "Monthly %", "Quarterly %", "RSI 14", "Trend", "Momentum",
-        "Data Date", "Quality Status"
-    ]
-    st.dataframe(
-        table[display_cols].style.format({
-            "Last Price": "{:,.2f}",
-            "Daily %": "{:+.2f}%",
-            "Weekly %": "{:+.2f}%",
-            "Monthly %": "{:+.2f}%",
-            "Quarterly %": "{:+.2f}%",
-            "RSI 14": "{:.2f}"
-        }, na_rep="—"),
-        use_container_width=True,
-        hide_index=True
-    )
+    sort=st.selectbox("Rank table by",["Daily %","Weekly %","Monthly %","Quarterly %","RSI 14","Index"])
+    t=view.sort_values(sort,ascending=(sort=="Index"))
+    cols_show=["Index","Region","Last Price","Daily %","Weekly %","Monthly %","Quarterly %","RSI 14","Trend","Momentum","Data Date","Quality Status"]
+    st.dataframe(t[cols_show].style.format({"Last Price":"{:,.2f}","Daily %":"{:+.2f}%","Weekly %":"{:+.2f}%","Monthly %":"{:+.2f}%","Quarterly %":"{:+.2f}%","RSI 14":"{:.1f}"},na_rep="—"),use_container_width=True,hide_index=True)
+    st.subheader("Global market breadth")
+    above=[int((data["Last Price"]>data[f"SMA {n}"]).sum()) for n in [20,50,200]]
+    b=st.columns(5); b[0].metric("Advancers",adv); b[1].metric("Decliners",dec)
+    for i,n in enumerate([20,50,200]): b[i+2].metric(f"Above SMA {n}",f"{above[i]}/{len(data)}")
+    breadth=pd.DataFrame({"Measure":["Above SMA 20","Above SMA 50","Above SMA 200"],"Indices":above})
+    fig=px.bar(breadth,x="Measure",y="Indices",text="Indices",title="Index participation above moving averages")
+    fig.update_layout(yaxis_range=[0,len(data)]); st.plotly_chart(fig,use_container_width=True)
 
-    st.subheader("Daily performance ranking")
-    chart_df = filtered.sort_values("Daily %", ascending=True)
-    fig = px.bar(
-        chart_df, x="Daily %", y="Index", color="Daily %",
-        color_continuous_scale="RdYlGn", orientation="h",
-        hover_data=["Region", "Weekly %", "Monthly %", "Trend"]
-    )
-    fig.add_vline(x=0, line_dash="dash", line_color="gray")
-    fig.update_layout(height=650, coloraxis_showscale=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-with tab_heatmap:
-    st.subheader("Global performance heatmap")
-    heat = filtered.set_index("Index")[["Daily %", "Weekly %", "Monthly %", "Quarterly %"]]
+with tabs[1]:
+    st.subheader("Global market heatmap")
+    heat=view.set_index("Index")[["Daily %","Weekly %","Monthly %","Quarterly %"]]
     if not heat.empty:
-        fig = px.imshow(
-            heat, text_auto=".2f", aspect="auto",
-            color_continuous_scale="RdYlGn", color_continuous_midpoint=0,
-            labels={"color": "Return %"}
-        )
-        fig.update_layout(height=max(450, len(heat) * 32))
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("Returns are based on trading-session observations, not calendar-day intervals.")
+        fig=px.imshow(heat,text_auto=".2f",aspect="auto",color_continuous_scale="RdYlGn",color_continuous_midpoint=0,labels={"color":"Return %"})
+        fig.update_layout(height=max(480,len(heat)*30)); st.plotly_chart(fig,use_container_width=True)
+    else: st.warning("No indices match the current filters.")
 
-with tab_regions:
+with tabs[2]:
     st.subheader("Regional comparison")
-    regional = data.groupby("Region").agg(
-        Indices=("Index", "count"),
-        Median_Daily=("Daily %", "median"),
-        Median_Weekly=("Weekly %", "median"),
-        Median_Monthly=("Monthly %", "median"),
-        Bullish=("Trend", lambda s: s.isin(["BULLISH", "STRONG BULLISH"]).sum()),
-        Bearish=("Trend", lambda s: s.isin(["BEARISH", "STRONG BEARISH"]).sum())
-    ).reset_index()
-    st.dataframe(
-        regional.style.format({
-            "Median_Daily": "{:+.2f}%",
-            "Median_Weekly": "{:+.2f}%",
-            "Median_Monthly": "{:+.2f}%"
-        }),
-        use_container_width=True,
-        hide_index=True
-    )
-    fig = px.bar(
-        regional.sort_values("Median_Daily"),
-        x="Median_Daily", y="Region", orientation="h",
-        color="Median_Daily", color_continuous_scale="RdYlGn",
-        labels={"Median_Daily": "Median daily return (%)"}
-    )
-    fig.add_vline(x=0, line_dash="dash", line_color="gray")
-    fig.update_layout(coloraxis_showscale=False)
-    st.plotly_chart(fig, use_container_width=True)
+    regional=data.groupby("Region").agg(Indices=("Index","count"),Median_Daily=("Daily %","median"),Median_Weekly=("Weekly %","median"),Median_Monthly=("Monthly %","median"),Bullish=("Trend",lambda x:x.isin(["BULLISH","STRONG BULLISH"]).sum()),Bearish=("Trend",lambda x:x.isin(["BEARISH","STRONG BEARISH"]).sum())).reset_index()
+    st.dataframe(regional.style.format({"Median_Daily":"{:+.2f}%","Median_Weekly":"{:+.2f}%","Median_Monthly":"{:+.2f}%"}),use_container_width=True,hide_index=True)
+    fig=px.bar(regional.sort_values("Median_Weekly"),x="Median_Weekly",y="Region",orientation="h",color="Median_Weekly",color_continuous_scale="RdYlGn",title="Regional median weekly return")
+    fig.add_vline(x=0,line_dash="dash",line_color="gray"); fig.update_layout(coloraxis_showscale=False)
+    st.plotly_chart(fig,use_container_width=True)
 
-with tab_index:
+with tabs[3]:
+    st.subheader("Strongest and weakest indices")
+    left,right=st.columns(2)
+    with left:
+        st.markdown("#### Strongest weekly")
+        st.dataframe(data.sort_values("Weekly %",ascending=False)[["Index","Region","Weekly %","Monthly %","Trend"]].head(10),use_container_width=True,hide_index=True)
+        st.markdown("#### Strongest monthly")
+        st.dataframe(data.sort_values("Monthly %",ascending=False)[["Index","Region","Monthly %","Trend"]].head(10),use_container_width=True,hide_index=True)
+    with right:
+        st.markdown("#### Weakest weekly")
+        st.dataframe(data.sort_values("Weekly %")[["Index","Region","Weekly %","Monthly %","Trend"]].head(10),use_container_width=True,hide_index=True)
+        st.markdown("#### Weakest monthly")
+        st.dataframe(data.sort_values("Monthly %")[["Index","Region","Monthly %","Trend"]].head(10),use_container_width=True,hide_index=True)
+
+with tabs[4]:
     st.subheader("Individual index analysis")
-    available = sorted(histories.keys())
-    if available:
-        chosen = st.selectbox("Choose an index", available)
-        series = histories[chosen]
-        detail = data[data["Index"] == chosen].iloc[0]
+    name=st.selectbox("Select an index",sorted(hist))
+    s=hist[name]; row=data[data.Index==name].iloc[0]
+    k=st.columns(4); k[0].metric("Last price",f"{row['Last Price']:,.2f}"); k[1].metric("Daily return",f"{row['Daily %']:+.2f}%")
+    k[2].metric("RSI 14","—" if pd.isna(row["RSI 14"]) else f"{row['RSI 14']:.1f}"); k[3].metric("Trend",row.Trend)
+    chart=pd.DataFrame({"Close":s})
+    for n in [20,50,200]: chart[f"SMA {n}"]=chart.Close.rolling(n).mean()
+    fig=go.Figure()
+    for c in ["Close","SMA 20","SMA 50","SMA 200"]: fig.add_trace(go.Scatter(x=chart.index,y=chart[c],name=c))
+    fig.update_layout(title=f"{name}: closing price and moving averages",height=480,hovermode="x unified")
+    st.plotly_chart(fig,use_container_width=True)
+    rr=rsi_calc(s); rf=go.Figure(go.Scatter(x=rr.index,y=rr,name="RSI 14"))
+    rf.add_hline(y=70,line_dash="dash",line_color="red"); rf.add_hline(y=30,line_dash="dash",line_color="green")
+    rf.update_layout(title="Relative Strength Index (14)",height=280,yaxis_range=[0,100]); st.plotly_chart(rf,use_container_width=True)
 
-        a, b, c, d = st.columns(4)
-        a.metric("Last price", f"{detail['Last Price']:,.2f}")
-        b.metric("Daily change", f"{detail['Daily %']:+.2f}%")
-        c.metric("RSI (14)", "—" if pd.isna(detail["RSI 14"]) else f"{detail['RSI 14']:.2f}")
-        d.metric("Trend", detail["Trend"])
-
-        chart = pd.DataFrame({"Close": series})
-        chart["SMA 20"] = chart["Close"].rolling(20).mean()
-        chart["SMA 50"] = chart["Close"].rolling(50).mean()
-        chart["SMA 200"] = chart["Close"].rolling(200).mean()
-
-        fig = go.Figure()
-        for col in ["Close", "SMA 20", "SMA 50", "SMA 200"]:
-            fig.add_trace(go.Scatter(
-                x=chart.index, y=chart[col], name=col, mode="lines"
-            ))
-        fig.update_layout(
-            title=f"{chosen} — closing price and moving averages",
-            height=500, xaxis_title="Date", yaxis_title="Index level",
-            hovermode="x unified"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        ag = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-        al = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-        rs = ag / al.replace(0, np.nan)
-        rsi_series = 100 - 100 / (1 + rs)
-        rsi_series = rsi_series.mask((al == 0) & (ag > 0), 100)
-        rsi_series = rsi_series.mask((al == 0) & (ag == 0), 50)
-
-        fig_rsi = go.Figure()
-        fig_rsi.add_trace(go.Scatter(x=rsi_series.index, y=rsi_series, name="RSI 14"))
-        fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
-        fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
-        fig_rsi.update_layout(title="Relative Strength Index (14)", height=300, yaxis_range=[0, 100])
-        st.plotly_chart(fig_rsi, use_container_width=True)
-
-with tab_quality:
-    st.subheader("Data quality and coverage")
-    quality = data[[
-        "Index", "Symbol", "Data Date", "Data Age Days",
-        "Daily %", "Quality Status"
-    ]].copy()
-    st.dataframe(quality, use_container_width=True, hide_index=True)
-
-    flagged = quality[quality["Quality Status"] != "NORMAL"]
+with tabs[5]:
+    st.subheader("Data quality monitoring")
+    quality=data[["Index","Symbol","Data Date","Data Age Days","Daily %","Quality Status"]]
+    st.dataframe(quality,use_container_width=True,hide_index=True)
+    flagged=quality[quality["Quality Status"]!="NORMAL"]
     if not flagged.empty:
-        st.warning("Some indices need manual verification.")
-        st.dataframe(flagged, use_container_width=True, hide_index=True)
-    else:
-        st.success("No automatic quality flags were triggered. This does not independently verify market data.")
+        st.warning("Review flagged rows manually. A flag is not proof of an incorrect quote.")
+        st.dataframe(flagged,use_container_width=True,hide_index=True)
+    else: st.success("No automatic flags. This is not independent verification.")
+    if not issues.empty: st.dataframe(issues,use_container_width=True,hide_index=True)
+    else: st.success("No download errors were returned.")
 
-    if not errors.empty:
-        st.subheader("Download issues")
-        st.dataframe(errors, use_container_width=True, hide_index=True)
-    else:
-        st.success("No download errors were returned by the data provider.")
-
-with tab_export:
-    st.subheader("Download market data")
-    csv_data = data.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download scanner results (CSV)",
-        data=csv_data,
-        file_name="global_market_scanner.csv",
-        mime="text/csv"
-    )
-
-    history_frame = pd.concat(histories, axis=1) if histories else pd.DataFrame()
-    if not history_frame.empty:
-        history_csv = history_frame.to_csv().encode("utf-8")
-        st.download_button(
-            "Download historical prices (CSV)",
-            data=history_csv,
-            file_name="global_index_price_history.csv",
-            mime="text/csv"
-        )
-
-    st.caption("For an Excel workbook, export the CSV files and open them in Excel. A multi-sheet Excel export can be added in a later iteration.")
+with tabs[6]:
+    st.subheader("Download complete research workbook")
+    regional=data.groupby("Region").agg(Indices=("Index","count"),Median_Daily=("Daily %","median"),Median_Weekly=("Weekly %","median"),Median_Monthly=("Monthly %","median"),Bullish=("Trend",lambda x:x.isin(["BULLISH","STRONG BULLISH"]).sum()),Bearish=("Trend",lambda x:x.isin(["BEARISH","STRONG BEARISH"]).sum())).reset_index()
+    weekly=data.sort_values("Weekly %",ascending=False).reset_index(drop=True); weekly.insert(0,"Weekly Rank",range(1,len(weekly)+1))
+    monthly=data.sort_values("Monthly %",ascending=False).reset_index(drop=True); monthly.insert(0,"Monthly Rank",range(1,len(monthly)+1))
+    quality=data[["Index","Symbol","Data Date","Data Age Days","Daily %","Quality Status"]]
+    history=pd.concat(hist,axis=1) if hist else pd.DataFrame()
+    out=BytesIO()
+    with pd.ExcelWriter(out,engine="openpyxl") as w:
+        for sheet,frame in {"Global Scanner":data,"Regional Comparison":regional,"Weekly Ranking":weekly,"Monthly Ranking":monthly,"Data Quality":quality,"Download Issues":issues,"Price History":history.reset_index()}.items():
+            frame.to_excel(w,sheet_name=sheet,index=False)
+            ws=w.book[sheet]; ws.freeze_panes="A2"; ws.auto_filter.ref=ws.dimensions
+            for col in ws.columns: ws.column_dimensions[col[0].column_letter].width=min(max(max(len(str(x.value or "")) for x in col)+2,12),34)
+    st.download_button("⬇ Download complete Excel research report",out.getvalue(),file_name=f"Rakesh_Global_Market_Intelligence_{date.today().isoformat()}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+    st.caption("Seven sheets: scanner, regional comparison, weekly ranking, monthly ranking, data quality, download issues and price history.")
 
 st.divider()
-st.caption(
-    "Global Market Intelligence V2.0 | Educational and research tool. "
-    "Not investment advice. Verify significant price moves with primary exchange data."
-)
+st.subheader("Daily market pulse")
+st.write(f"Across {len(data)} retrieved indices, {adv} advanced and {dec} declined. {bull} meet the bullish trend rules and {bear} meet the bearish rules. {above[2]} of {len(data)} indices are above their 200-session moving average. Best daily performer: {best.Index} ({best['Daily %']:+.2f}%). Weakest: {worst.Index} ({worst['Daily %']:+.2f}%).")
+st.caption("Rakesh Parkar | Global Market Intelligence V2.1 • Rule-based analytics, not AI-generated advice. Yahoo Finance/yfinance coverage and data quality are not guaranteed.")
